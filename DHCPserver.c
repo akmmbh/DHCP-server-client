@@ -11,7 +11,57 @@
 #include <sys/socket.h>
  
 #define BUFLEN 512  //Max length of buffer
- 
+ #define MAX_IPS 10
+#define LEASE_DURATION 3600
+
+typedef struct{
+    char ip[16];
+    time_t lease_start;
+    struct sockaddr_in client_addr;
+    int active //1 if leased ,0 if free
+}LeaseEntry;
+LeaseEntry leaseTable[MAX_IPS];
+
+void initLeaseTable(){
+    for(int i=0;i<MAX_IPS;i++){
+        sprintf(leaseTable[i].ip,"192.168.10.%d",i+1);
+        leaseTable[i].active=0;
+
+    }
+}
+
+void checkExpiredLeases(){
+    time_t now =time(NULL);
+    for(int i=0;i<MAX_IPS;i++){
+        if(leaseTable[i].active && difftime(now,leaseTable[i].lease_start)>=LEASE_DURATION){
+            printf("[INFO] IP %s lease expired",leaseTable[i].ip);
+            leaseTable[i].active=0;
+        }
+    }
+}
+
+LeaseEntry* getAvailableLease(struct sockaddr_in *client){
+    checkExpiredLeases();
+
+
+    //First loop: Reuse existing lease if the client already has one
+    for(int i=0;i<MAX_IPS;i++){
+        if(leaseTable[i].active &&leaseTable[i].client_addr.sin_addr.s_addr == client->sin_addr.s_addr&& leaseTable[i].client_addr.sin_port == client->sin_port ){
+            return &leaseTable[i];//this client is already owns the IP
+        }
+    }
+
+    //find a new unused ip
+    for(int i=0;i<MAX_IPS;i++){
+        if(!leaseTable[i].active){
+            leaseTable[i].active=1;
+            leaseTable[i].lease_start=time(NULL);
+            leaseTable[i].client_addr=*client;
+            return &leaseTable[i];//assign new IP
+        }
+    }
+    return NULL;
+}
 void die(char *s)
 {
     perror(s);
@@ -22,20 +72,20 @@ void die(char *s)
  
 int main(int argc, char *argv[])
 {
+     if(argc!=2){
+        printf("Usage: %s <port>\n",argv[0]);
+        exit(1);
+    }
     struct sockaddr_in si_me, si_other;
-    struct timeval timeout={0,0};
-    fd_set readfds;
-    int select_ret;
+    
     int s, i, j = 0, slen = sizeof(si_other), recv_len, portno;
-    int ctransID = 0, lifeTime = 3600;
-    char buf[BUFLEN], message[1024];
-    char cyiaddr[BUFLEN] = "";
-    char fileGetIPAddr[50];
-    char stringLine[50], rmLine1[50], ipCount[5];
-    FILE *fileStream, *fileTemp;
-    time_t start, end;
-    double elapsed = 0;
-     
+   
+    char buf[BUFLEN];
+ 
+      LeaseEntry* lease;
+   //init lease table
+
+    initLeaseTable();
     //create a UDP socket
     if((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
         die("socket");
@@ -60,104 +110,51 @@ int main(int argc, char *argv[])
     {
         do
         {
-            FD_ZERO(&readfds); //Zero out socket set
-            FD_SET(s, &readfds); //Add socket to listen to
-            select_ret = select(s+1, &readfds, NULL, NULL, &timeout);
-          
-            fflush(stdout);
+        
 
-            //Begin sequence for DHCP discover - Receive broadcast message from client
-            printf("\nBegin DHCP 4-Handshake - Discover client arrives\n");
-            if((recv_len = recvfrom(s, &cyiaddr, sizeof(cyiaddr), 0, (struct sockaddr *) &si_other, &slen)) == -1)
-                die("recvfrom()");
-            if((recv_len = recvfrom(s, &ctransID, sizeof(ctransID), 0, (struct sockaddr *) &si_other, &slen)) == -1)
-                die("recvfrom()");
-            printf("Broadcast from client from %s, port number:%d\n", inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port));
-            printf("yiaddr: %s\n", cyiaddr);
-            printf("Transaction ID: %d\n", ctransID);
+             // --- DISCOVER ---
+        if ((recv_len = recvfrom(s, &buf, sizeof(buf), 0, (struct sockaddr *) &si_other, &slen)) == -1)
+           die("recvfrom");
+        printf("[DISCOVER] Received from client %s:%d\n",
+               inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port));
 
-            //Begin sequence for DHCP offer
-            fileStream = fopen("IPaddress.txt", "r"); //Open the IPaddress file for reading
-            fgets(fileGetIPAddr, 50, fileStream); //Get the IP Address from the file to assign to the client
-            strcpy(cyiaddr, fileGetIPAddr); //Assign it to the client
-            printf("\nAssigned yiaddr is: %s", cyiaddr); 
-            printf("For Transaction ID: %d\n", ctransID);
-            printf("Assigned Lifetime: 3600 secs\n\n"); //Assign the Lifetime of the IP address for 1 hour, timer not set yet
-            //Send to the server, print error if it doesn't work
-            if(sendto(s, &cyiaddr, sizeof(cyiaddr), 0, (struct sockaddr *) &si_other, slen) == -1)
-                die("sendto()");
-            if(sendto(s, &ctransID, sizeof(ctransID), 0, (struct sockaddr *) &si_other, slen) == -1)
-                die("sendto()");
-            if(sendto(s, &lifeTime, sizeof(lifeTime), 0, (struct sockaddr *) &si_other, slen) == -1)
-                die("sendto()");
+        // --- TRANSACTION ID ---
+        if ((recv_len = recvfrom(s, &transID, sizeof(transID), 0, (struct sockaddr *) &si_other, &slen)) == -1)
+            die("recvfrom");
 
-            //Begin sequence for DHCP request - Receive request/confirmation message from client
-            if((recv_len = recvfrom(s, &cyiaddr, sizeof(cyiaddr), 0, (struct sockaddr *) &si_other, &slen)) == -1)
-                die("recvfrom()");
-            if((recv_len = recvfrom(s, &ctransID, sizeof(ctransID), 0, (struct sockaddr *) &si_other, &slen)) == -1)
-                die("recvfrom()");
-            if((recv_len = recvfrom(s, &lifeTime, sizeof(lifeTime), 0, (struct sockaddr *) &si_other, &slen)) == -1)
-                die("recvfrom()");
-            printf("Request from client from %s, port number:%d\n", inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port));
-            printf("Confirmed yiaddr: %s", cyiaddr);
-            printf("Transaction ID: %d\n", ctransID);
-            printf("Lifetime: %d\n\n", lifeTime);
+        lease = getAvailableLease(&si_other);
+        if (!lease) {
+            printf("[ERROR] No IPs available!\n");
+            continue;
+        }
 
-            //Begin sequence for DHCP acknowledge - Send acknowledgment message to client
-            printf("Sending ACK message to client:%s, on port number:%d\n", inet_ntoa(si_other.sin_addr), ntohs(si_other.sin_port));
-            printf("yiaddr: %s", cyiaddr);
-            printf("Transaction ID: %d\n", ctransID);
-            printf("Lifetime: %d\n\n", lifeTime);
-            //Send ACK message to client
-            if(sendto(s, &cyiaddr, sizeof(cyiaddr), 0, (struct sockaddr *) &si_other, slen) == -1)
-                die("sendto()");
-            if(sendto(s, &ctransID, sizeof(ctransID), 0, (struct sockaddr *) &si_other, slen) == -1)
-                die("sendto()");
-            if(sendto(s, &lifeTime, sizeof(lifeTime), 0, (struct sockaddr *) &si_other, slen) == -1)
-                die("sendto()");
+        // --- OFFER ---
+        printf("[OFFER] Offering IP %s to Transaction ID %d\n", lease->ip, transID);
+        sendto(s, lease->ip, sizeof(lease->ip), 0, (struct sockaddr*)&si_other, slen);
+        sendto(s, &transID, sizeof(transID), 0, (struct sockaddr*)&si_other, slen);
+        sendto(s, &LEASE_DURATION, sizeof(LEASE_DURATION), 0, (struct sockaddr*)&si_other, slen);
 
-            //Start the Lifetime timer here
-            time(&start);
+        // --- REQUEST ---
+        if ((recv_len = recvfrom(s, buf, sizeof(buf), 0, (struct sockaddr *) &si_other, &slen)) == -1)
+           die("recvfrom");
+        if ((recv_len = recvfrom(s, &transID, sizeof(transID), 0, (struct sockaddr *) &si_other, &slen)) == -1)
+           die("recvfrom");
+        if ((recv_len = recvfrom(s, &LEASE_DURATION, sizeof(LEASE_DURATION), 0, (struct sockaddr *) &si_other, &slen)) == -1)
+           die("recvfrom");
 
-            //Update the IPaddress file
-            //fileStream = fopen("IPadress.txt", "r"); //Original file
-            fileTemp = fopen("File_copy.txt", "w");  //Temporary file
+        printf("[REQUEST] Client confirms IP %s\n", lease->ip);
 
-            i = 0;
-            while(i < 9)
-            {
-                fscanf(fileStream, "%s", stringLine); //Scan the line of the file at line i
-                i++;
-                if(i == 0)
-                    strcpy(rmLine1, stringLine); //Get the first line in the IPaddress file for file removal
-                else //Not the first IP Address in IPaddress.txt
-                    fprintf(fileTemp, "%s\n", stringLine); //Copy the next line to the temporary file File_copy.txt
-            }
-            strcpy(rmLine1, "192.168.10."); 
-            //itoa(j, ipCount, 10);
-            sprintf(ipCount, "%d", j);
-            j++; //Update the counter for next IP Address in list to use
-            strcat(rmLine1, ipCount); //Attach updated IP Address and store in variable
-            fprintf(fileTemp, "%s\n", rmLine1); //Update the last used IP address back to the file to cycle through
-            fclose(fileStream);
-            fclose(fileTemp);
-
-            system("rm IPaddress.txt"); //Remove old IPaddress.txt
-            system("mv File_copy.txt IPaddress.txt"); //Rename File_copy.txt to IPaddress.txt
-
-            //Grab the end time then show elapsed for Lifetime counter if it were a requirement
-            //it would be implemented with something like this...
-            sleep(5);
-            time(&end);
-            elapsed = difftime(end, start);
-            printf("Elapsed time for IPaddress: %s is - %.2lf secs\n\n", rmLine1, elapsed);
-
-            //If we run out of IP addresses to assign to the clients
-            if(j == 10)
-                die("There are no more IP address...Exiting program...\n");
-        }while(select_ret > 0);
+        // --- ACK ---
+        printf("[ACK] Confirming lease for IP %s\n", lease->ip);
+        sendto(s, lease->ip, sizeof(lease->ip), 0, (struct sockaddr*)&si_other, slen);
+        sendto(s, &transID, sizeof(transID), 0, (struct sockaddr*)&si_other, slen);
+        sendto(s, &LEASE_DURATION, sizeof(LEASE_DURATION), 0, (struct sockaddr*)&si_other, slen);
     }
- 
+}
+
     close(s);
     return 0;
 }
+    
+ 
+ 
